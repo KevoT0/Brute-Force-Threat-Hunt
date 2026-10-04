@@ -1,22 +1,27 @@
-# Threat Hunt: RDP Brute-Force Attack on Internet-Facing Windows Hosts
+# Threat Hunt: Brute-Force Attack on Internet-Facing Windows Hosts
 
-**Lab environment:** Microsoft Sentinel Training Lab dataset (`SecurityEvent`)
-**SC-200 domain:** Perform threat hunting · Respond to security incidents
-**Detection surface:** Microsoft Sentinel (Defender portal) · KQL
-
----
-
-## Summary
-
-Hunting Windows security events for signs of password-guessing activity, I identified a large-scale brute-force attack against two internet-facing hosts. The attacker generated over 10,000 failed logons against common and default account names — a classic dictionary spray. I then verified whether any attempt succeeded and confirmed the attack **failed**: no targeted account achieved a logon, and the only successful sign-ins on the affected hosts were the built-in `SYSTEM` account (normal OS activity, not an intrusion).
-
-**Verdict:** True positive — a genuine brute-force attack occurred, but was **unsuccessful**. Severity: low/contained, with a hardening gap to remediate.
+**Platform:** Microsoft Sentinel · KQL · Windows Security Events
+**Domain:** Threat Hunting · Credential access · Attack-surface hardening
+**Detection surface:** Microsoft Sentinel (Defender portal) — `SecurityEvent`
 
 ---
 
-## Environment note
+## The problem — a real-world attack, not a hypothetical
 
-Performed in a lab tenant using Microsoft's Sentinel Training Lab dataset. The Windows telemetry lands in the standard `SecurityEvent` table, so the logic and Event IDs used here transfer directly to a production environment.
+Internet-exposed remote-access services are among the most relentlessly attacked targets on the internet, and a primary entry vector for ransomware. The **2021 Colonial Pipeline** incident — which shut down the largest fuel pipeline in the US and triggered panic fuel-buying across the East Coast — began with a **single compromised remote-access credential** on an account that lacked MFA. More broadly, the DarkSide, Phobos, and Dharma ransomware families have all used exposed remote access and credential guessing as a routine foothold. [1][2]
+
+Attackers scan the internet continuously for exposed login services, then spray them with automated dictionaries of common usernames and passwords. The volume is enormous and the signal is simple — a flood of failed logons — but the analyst's job is not just to *see* the flood. It is to answer the question that sets severity: **did any of it succeed?** A thousand failures is noise; one success buried among them is a breach.
+
+## What this project is — and the skills it proves
+
+This project is a **threat hunt across Windows security telemetry** that detects a large-scale brute-force campaign, identifies the targeted assets, and — critically — verifies whether the attack succeeded, correctly filtering out benign system activity that a less careful analyst would misread as a compromise. It then delivers root-cause hardening recommendations aimed at the exposed asset, since the attacker's source could not be blocked.
+
+| Real-world failure | Capability this project builds |
+|---|---|
+| Exposed login services are sprayed continuously and go unnoticed | Detect brute-force floods via failed-logon aggregation |
+| Analyst reports a flood but never checks if it worked | Success/failure verification that sets true severity |
+| Benign `SYSTEM` logons mistaken for intrusions | Built-in vs. malicious account triage to avoid false escalations |
+| No source IP to block leaves the team feeling helpless | Pivot to root-cause hardening of the victim asset |
 
 ---
 
@@ -58,7 +63,7 @@ SecurityEvent
 
 The pattern itself is diagnostic. The list is dominated by **common default usernames** and **localised admin names** (`ADMINISTRADOR` – Spanish, `ADMINISTRATEUR` – French). A human would not guess these; an automated tool with a built-in wordlist would. This is a **dictionary spray** — the attacker is guessing both usernames *and* passwords, so most of these accounts likely do not even exist on the target. A failed logon is recorded regardless of whether the account exists.
 
-![Failed Logon](https://github.com/KevoT0/RDP-Brute-Force-Attack/blob/main/5.png)
+![Failed logon pile dominated by default and foreign-language admin names](5.png)
 
 ### Step 2 — Add the target asset
 
@@ -75,7 +80,7 @@ SecurityEvent
 - **`SOC-FW-RDP`** — `ADMINISTRATOR` alone hit 9,997 times, plus `ADMIN`, `USER`, `TEST`, `SERVER`, and foreign-language admin variants.
 - **`SHIR-Hive`** — `admin` / `administrator` hammered ~2,000+ times each.
 
-The host name `SOC-FW-RDP` is itself a signal: an internet-facing **RDP** (Remote Desktop Protocol) server. Internet-exposed RDP is one of the most heavily brute-forced services in existence — attackers continuously scan for and spray open RDP endpoints.
+The host naming and the attack shape (high-volume failed logons against default admin accounts on internet-facing hosts) point to an exposed remote-access service as the target. To confirm the exact logon channel — for example RDP (RemoteInteractive) versus network logon — the hunt would filter on the `LogonType` field (`LogonType == 10` indicates RemoteInteractive/RDP). Absent that confirmation, the finding is stated as a brute-force attack against internet-facing hosts rather than asserting a specific protocol.
 
 **Source limitation:** `IpAddress` was empty for the attack rows. On certain Windows `4625` logon types the source IP is not populated in `IpAddress`, and may appear in alternate fields (`WorkstationName`, `ClientAddress`). This left the attacker's source unidentified — an important gap for response, and a logging improvement to flag.
 
@@ -96,7 +101,8 @@ SecurityEvent
 
 **No `administrator`, no `admin`, no attacker-guessed account succeeded.**
 
-![Successful Logon](https://github.com/KevoT0/RDP-Brute-Force-Attack/blob/main/6.png)
+![Successful logon check — only NT AUTHORITY SYSTEM succeeded on the attacked hosts](6.png)
+
 ---
 
 ## Findings & analysis
@@ -107,6 +113,8 @@ SecurityEvent
 
 The remaining successful logons elsewhere (`CONTOSO\SamiraA`, `CONTOSO\RonHD`, `AATPService`) are legitimate domain activity on other machines, unrelated to the attack.
 
+**Verdict:** True positive, **unsuccessful** brute-force attack against `SOC-FW-RDP` and `SHIR-Hive`. No compromise occurred, but the hosts are exposed and under continuous attack.
+
 ---
 
 ## MITRE ATT&CK mapping
@@ -115,34 +123,48 @@ The remaining successful logons elsewhere (`CONTOSO\SamiraA`, `CONTOSO\RonHD`, `
 |---|---|---|
 | Credential Access | T1110.001 – Brute Force: Password Guessing | 10,000+ failed logons against default account names |
 | Credential Access | T1110.003 – Brute Force: Password Spraying | Wide spread of guessed usernames across hosts |
-| Initial Access | T1133 – External Remote Services | Internet-facing RDP host (`SOC-FW-RDP`) as the entry point targeted |
+| Initial Access | T1133 – External Remote Services | Internet-facing host targeted as the entry point |
 
 ---
 
-## Verdict & response
+## Response & hardening
 
-**Verdict:** True positive, **unsuccessful** brute-force attack against `SOC-FW-RDP` and `SHIR-Hive`. No compromise occurred, but the hosts are exposed and under continuous attack.
+The attacker's source could not be blocked (no source IP captured), so the response is root-cause focused — removing the conditions that let the attack happen at all:
 
-**Recommended hardening (root-cause focused, since the attacker's source could not be blocked):**
-
-1. **Remove RDP from direct internet exposure** — the root fix. Place RDP behind a VPN or bastion/jump host, or restrict it to known admin source IPs. If the service is unreachable from the open internet, the attack never begins.
+1. **Remove the exposed service from direct internet exposure** — the root fix. Place remote access behind a VPN or bastion/jump host, or restrict it to known admin source IPs. If the service is unreachable from the open internet, the attack never begins.
 2. **Enforce an account lockout policy** — lock accounts after a small number of failed attempts (e.g. 5) for a set duration. This makes high-volume guessing mechanically impossible without needing to identify the attacker. *Caveat:* lockout can be abused for denial-of-service (deliberately locking legitimate users), so pair it with monitoring rather than treating it as a complete solution.
-3. **Enforce MFA** on remote-access accounts so a correct password guess alone is insufficient to authenticate.
-4. **Improve logging** to reliably capture the source of `4625` events (workstation/IP), removing the blind spot that prevented source attribution in this investigation.
+3. **Enforce MFA** on remote-access accounts so a correct password guess alone is insufficient to authenticate — the control whose absence enabled the Colonial Pipeline breach.
+4. **Improve logging** to reliably capture the source and logon type of `4625` events (workstation/IP, `LogonType`), removing the blind spot that prevented source attribution and protocol confirmation in this investigation.
 
 ---
 
-## Lessons learned
+## Key design decisions
 
-- **A failed attack is still a true positive.** "True positive, unsuccessful" ≠ "false positive." The detection was correct; the attack simply did not work.
-- **The shape of the data reveals the tooling.** Foreign-language admin names and default usernames are the fingerprint of an automated dictionary spray, not human activity.
-- **Read the asset name.** `SOC-FW-RDP` telegraphs an internet-facing RDP box — high-value context before any query runs.
-- **Know your built-in accounts.** `SYSTEM` and machine (`$`) accounts logging on successfully is normal; mistaking them for intrusions produces false escalations.
-- **"Field is empty" ≠ "data doesn't exist."** Source detail may live in an alternate column; a blank field is a prompt to look elsewhere, not a dead end.
-- **When you can't fix the attacker, harden the victim.** No source IP to block → pivot to root-cause hardening of the exposed asset.
+- **A failed attack is still a true positive.** "True positive, unsuccessful" ≠ "false positive" — the detection was correct; the attack simply did not work. Reporting it accurately matters for metrics and for recognising a host that *will* eventually be breached if left exposed.
+- **Verify success before declaring severity.** The hunt does not stop at "there is a flood"; it pivots to `4624` to answer whether anything got in — the single fact that separates noise from breach.
+- **State what the data proves, not what it suggests.** The attack is characterised as brute-force against internet-facing hosts; the specific protocol (e.g. RDP) is called out as something to confirm via `LogonType`, not asserted from host naming alone.
+- **Know your built-in accounts.** `SYSTEM` and machine (`$`) accounts logging on successfully is normal; recognising them as benign prevents false escalations.
+- **"Field is empty" ≠ "data doesn't exist."** A blank `IpAddress` is a prompt to look in alternate columns, not a dead end.
+- **When you can't fix the attacker, harden the victim.** With no source IP to block, the response targets the exposed asset — the only thing within the defender's control.
+
+---
+
+## Future improvements
+
+- **Confirm the logon channel** — add `where LogonType == 10` to establish whether the brute force came over RDP specifically, rather than inferring it from host naming.
+- **Operationalise as an analytics rule** — a scheduled Sentinel rule firing on a failed-logon threshold per host/hour, with the threshold tuned against the observed false-positive rate.
+- **Enrich source attribution** — parse `WorkstationName`/`ClientAddress` so future detections capture the attacker's origin even when `IpAddress` is blank.
+- **Correlate failure-then-success** — a time-windowed rule that specifically flags a successful logon immediately following a failure burst on the same account/host, catching the moment a spray actually lands.
 
 ---
 
 ## Skills demonstrated
 
-Threat hunting with KQL · Windows Event ID analysis (4624/4625) · Attack-pattern recognition · Success/failure verification · Built-in vs. malicious account triage · Root-cause hardening recommendations · MITRE ATT&CK mapping
+Threat hunting with KQL · Windows Event ID analysis (4624/4625) · Attack-pattern recognition · Success/failure verification · Built-in vs. malicious account triage · Evidence-based classification · Root-cause hardening recommendations · MITRE ATT&CK mapping
+
+---
+
+## References
+
+1. CISA — [DarkSide Ransomware: Best Practices for Preventing Business Disruption (AA21-131A)](https://www.cisa.gov/news-events/cybersecurity-advisories/aa21-131a) — Colonial Pipeline, compromised remote-access credential without MFA (May 2021).
+2. CISA / FBI — [#StopRansomware: Phobos Ransomware (AA24-060A)](https://www.cisa.gov/news-events/cybersecurity-advisories/aa24-060a) — exposed remote access and credential guessing as a primary initial-access vector.
